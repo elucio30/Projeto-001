@@ -1,0 +1,5 @@
+{
+  "name": "SSA - Segurança do Alimento",
+  "description": "Sistema de monitoramento de perecíveis, alertas de temperatura e gestão de ações corretivas.",
+  "requestFramePermissions": []
+}
