@@ -18,7 +18,9 @@ try {
     id INTEGER PRIMARY KEY,
     name TEXT UNIQUE,
     city TEXT DEFAULT '',
-    is_active INTEGER DEFAULT 1
+    is_active INTEGER DEFAULT 1,
+    salesrun_api_key TEXT,
+    salesrun_webhook_url TEXT
   );
 
   CREATE TABLE IF NOT EXISTS users (
@@ -141,14 +143,11 @@ const seed = () => {
     { email: 'gerente2@loja.com', name: 'Gerente Loja 02', role: 'manager', store_id: 2 },
   ];
 
+  const hash = bcrypt.hashSync('senha123', 10);
   users.forEach(u => {
-    const hash = bcrypt.hashSync('senha123', 10);
     const existing = db.prepare('SELECT * FROM users WHERE email = ?').get(u.email);
     if (!existing) {
       db.prepare('INSERT INTO users (email, name, role, store_id, password_hash) VALUES (?, ?, ?, ?, ?)').run(u.email, u.name, u.role, u.store_id, hash);
-    } else {
-      // Force update password to ensure it matches 'senha123' with current bcrypt
-      db.prepare('UPDATE users SET password_hash = ? WHERE email = ?').run(hash, u.email);
     }
   });
 
@@ -213,11 +212,37 @@ const authenticate = (req: any, res: any, next: any) => {
   }
 };
 
+async function pushToSalesRun(storeId: number, data: any) {
+  const store: any = db.prepare('SELECT salesrun_webhook_url, salesrun_api_key FROM stores WHERE id = ?').get(storeId);
+  if (store?.salesrun_webhook_url) {
+    console.log(`Pushing to SalesRun: ${store.salesrun_webhook_url}`);
+    try {
+      await fetch(store.salesrun_webhook_url, {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'X-SalesRun-Key': store.salesrun_api_key || ''
+        },
+        body: JSON.stringify({
+          source: 'SSA-FoodSafety',
+          timestamp: new Date().toISOString(),
+          ...data
+        })
+      });
+    } catch (e) {
+      console.error('SalesRun Push Failed:', e);
+    }
+  }
+}
+
 async function startServer() {
   const app = express();
   app.use(cors());
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
+
+  // Health check for platform
+  app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
   // --- API Routes ---
   app.post('/api/auth/token', (req, res) => {
@@ -313,8 +338,34 @@ async function startServer() {
   });
 
   app.post('/api/actions/:action_id/complete', authenticate, (req: any, res) => {
-    db.prepare('UPDATE actions SET status = "done", completed_at = CURRENT_TIMESTAMP, completed_by = ? WHERE id = ?').run(req.user.id, req.params.action_id);
+    const { evidence } = req.body;
+    db.prepare('UPDATE actions SET status = "done", completed_at = CURRENT_TIMESTAMP, completed_by = ?, evidence = ? WHERE id = ?')
+      .run(req.user.id, JSON.stringify(evidence || {}), req.params.action_id);
+    
+    // Integration Push
+    const action: any = db.prepare('SELECT * FROM actions WHERE id = ?').get(req.params.action_id);
+    if (action) {
+      pushToSalesRun(action.store_id, {
+        type: 'ACTION_COMPLETED',
+        action_id: action.id,
+        title: action.title,
+        completed_by: req.user.sub,
+        evidence: evidence
+      });
+    }
+    
     res.json({ ok: true });
+  });
+
+  app.get('/api/devices/:device_id/history', authenticate, (req: any, res) => {
+    const history = db.prepare(`
+      SELECT ts, value 
+      FROM readings 
+      WHERE device_id = ? 
+      ORDER BY ts DESC 
+      LIMIT 50
+    `).all(req.params.device_id);
+    res.json(history.reverse());
   });
 
   // --- Admin Routes ---
@@ -360,6 +411,14 @@ async function startServer() {
     res.json({ ok: true });
   });
 
+  app.post('/api/stores/:store_id/integrations/salesrun', authenticate, (req: any, res) => {
+    if (req.user.role !== 'ssa') return res.status(403).json({ error: 'Forbidden' });
+    const { api_key, webhook_url } = req.body;
+    db.prepare('UPDATE stores SET salesrun_api_key = ?, salesrun_webhook_url = ? WHERE id = ?')
+      .run(api_key, webhook_url, req.params.store_id);
+    res.json({ ok: true });
+  });
+
   // --- IoT Ingestion ---
   app.post('/api/iot/reading', (req, res) => {
     const { store_id, device_uid, device_type, sector_code, value, unit } = req.body;
@@ -374,6 +433,8 @@ async function startServer() {
 
     db.prepare('INSERT INTO readings (device_id, value, unit) VALUES (?, ?, ?)').run(device.id, value, unit);
 
+    // Update device last reading in meta if needed (optional)
+    
     // Check thresholds
     const th: any = db.prepare('SELECT * FROM thresholds WHERE sector_id = ? AND device_type = ?').get(sector.id, device_type);
     if (th) {
@@ -386,6 +447,16 @@ async function startServer() {
           db.prepare('INSERT INTO alerts (store_id, sector_id, severity, title, detail) VALUES (?, ?, ?, ?, ?)').run(
             store_id, sector.id, severity, `Temperatura fora do padrão - ${sector_code}`, `Leitura: ${value}${unit}. Faixa: ${th.min_value}..${th.max_value}`
           );
+          
+          // Integration Push
+          pushToSalesRun(store_id, {
+            type: 'ALERT',
+            severity,
+            title: `Temperatura fora do padrão - ${sector_code}`,
+            detail: `Leitura: ${value}${unit}. Faixa: ${th.min_value}..${th.max_value}`,
+            sector: sector_code
+          });
+
           db.prepare('INSERT INTO actions (store_id, sector_id, title, instruction, assigned_role) VALUES (?, ?, ?, ?, ?)').run(
             store_id, sector.id, 'Verificar equipamento / reposição', 'Checar portas, carga térmica, degelo. Acionar manutenção se necessário.', severity === 'red' ? 'manager' : 'operator'
           );
@@ -444,6 +515,15 @@ async function startServer() {
       db.prepare('UPDATE actions SET status = "escalated", assigned_role = "manager" WHERE id = ?').run(a.id);
       db.prepare('INSERT INTO alerts (store_id, sector_id, severity, title, detail) VALUES (?, ?, "yellow", "Escalonamento: Ação Pendente", "Ação pendente há mais de 30 min. Escalonada para gerente.")')
         .run(a.store_id, a.sector_id);
+      
+      // Integration Push
+      pushToSalesRun(a.store_id, {
+        type: 'ESCALATION',
+        action_id: a.id,
+        title: a.title,
+        status: 'escalated',
+        reason: 'Time limit exceeded (30m)'
+      });
     });
   }, 60000); // Check every minute
 
